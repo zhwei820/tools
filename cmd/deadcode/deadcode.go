@@ -46,6 +46,7 @@ var (
 	filterFlag    = flag.String("filter", "<module>", "report only packages matching this regular expression (default: module of first package)")
 	generatedFlag = flag.Bool("generated", false, "include dead functions in generated Go files")
 	whyLiveFlag   = flag.String("whylive", "", "show a path from main to the named function")
+	noReflectFlag = flag.Bool("noreflect", true, "report methods kept alive only by the conservative \"exported method of runtime type\" reflection rule")
 	formatFlag    = flag.String("f", "", "format output records using template")
 	jsonFlag      = flag.Bool("json", false, "output JSON records")
 	cpuProfile    = flag.String("cpuprofile", "", "write CPU profile to this file")
@@ -207,8 +208,32 @@ func main() {
 	})
 
 	// Compute the reachabilty from main.
-	// (Build a call graph only for -whylive.)
-	res := rta.Analyze(roots, *whyLiveFlag != "")
+	// (Build a call graph for -whylive or -noreflect.)
+	res := rta.Analyze(roots, *whyLiveFlag != "" || *noReflectFlag)
+
+	// Decide which functions count as "really reachable".
+	//
+	// By default we use res.Reachable, which includes every exported
+	// method of any concrete type that becomes a runtime type (e.g.
+	// flows into an interface), because such a method might be invoked
+	// reflectively via reflect.Value.MethodByName. That rule is sound but
+	// imprecise: a handler type registered with a reflective DI framework
+	// (uber-go/dig, fx, ...) keeps *all* of its methods alive even if
+	// none of them is ever actually dispatched to.
+	//
+	// With -noreflect we instead derive the reachable set by BFS over
+	// res.CallGraph. The call graph contains edges for static, dynamic,
+	// and interface calls, plus synthetic edges from (*reflect.Value).Call
+	// to every address-taken function — so genuine reflective use sites
+	// (e.g. dig calling a Provide'd constructor) are still followed —
+	// but it does NOT contain edges for methods kept alive solely by the
+	// conservative "exported method of runtime type" rule. Those methods
+	// therefore show up as dead under -noreflect. The result is unsound
+	// but matches what a human reviewer would call dead code.
+	reachableFuncs := res.Reachable
+	if *noReflectFlag {
+		reachableFuncs = bfsCallGraph(roots, res.CallGraph)
+	}
 
 	// Subtle: the -test flag causes us to analyze test variants
 	// such as "package p as compiled for p.test" or even "for q.test".
@@ -222,7 +247,7 @@ func main() {
 	// (We use Position not Pos to avoid assuming that files common
 	// to packages "p" and "p [p.test]" were parsed only once.)
 	reachablePosn := make(map[token.Position]bool)
-	for fn := range res.Reachable {
+	for fn := range reachableFuncs {
 		if fn.Pos().IsValid() || fn.Name() == "init" {
 			reachablePosn[prog.Fset.Position(fn.Pos())] = true
 		}
@@ -442,6 +467,42 @@ func printObjects(format string, objects []any) {
 		}
 		os.Stdout.Write(buf.Bytes())
 	}
+}
+
+// bfsCallGraph returns the set of functions reachable from roots by
+// traversing the call graph. Unlike res.Reachable it does not include
+// methods kept alive solely by the conservative "every exported method
+// of a runtime type is reachable" rule, because that rule does not add
+// call graph edges.
+func bfsCallGraph(roots []*ssa.Function, cg *callgraph.Graph) map[*ssa.Function]struct{ AddrTaken bool } {
+	reachable := make(map[*ssa.Function]struct{ AddrTaken bool })
+	if cg == nil {
+		return reachable
+	}
+	var queue []*ssa.Function
+	for _, root := range roots {
+		if _, ok := reachable[root]; !ok {
+			reachable[root] = struct{ AddrTaken bool }{}
+			queue = append(queue, root)
+		}
+	}
+	for len(queue) > 0 {
+		fn := queue[0]
+		queue = queue[1:]
+		node := cg.Nodes[fn]
+		if node == nil {
+			continue
+		}
+		for _, edge := range node.Out {
+			callee := edge.Callee.Func
+			if _, ok := reachable[callee]; ok {
+				continue
+			}
+			reachable[callee] = struct{ AddrTaken bool }{}
+			queue = append(queue, callee)
+		}
+	}
+	return reachable
 }
 
 // pathSearch returns the shortest path from one of the roots to one
